@@ -1,0 +1,12 @@
+.nextflow*
+NOTES.sh
+data/
+downloaded/
+fastqcd/
+flowinfo/
+keys/
+meta/
+multiqc*
+reads_ready/
+results/
+split/
