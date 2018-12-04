@@ -23,20 +23,19 @@ process fetchRemoteReference {
     url
 
   output:
-    file "*" into references
+    file "${outname}" into references, refs4regions, refs4calls
 
   script:
-    outname = url.replaceAll(".*/","")
-    // if(params.trialLines == null) {
+    outname = url.replaceAll(".*/","").replaceAll("\\.gz\$","")
+    if(url.endsWith(".gz")) {
+      """
+      curl $url | gunzip --stdout  > ${outname}
+      """
+    } else {
       """
       curl $url > ${outname}
       """
-    // } else {
-    //   outname = "${params.trialLines}_trialLines_${outname}"
-    //   """
-    //   curl $url | gunzip --stdout | head -n ${params.trialLines} | pigz -cp ${task.cpus} > ${outname}
-    //   """
-    // }
+    }
 }
 
 
@@ -64,10 +63,11 @@ process align {
   tag("${meta}")
 
   input:
-    set val(idxmeta), file("*"), val(sample), file(reads) from indices.combine(readPairs)
+    set val(idxmeta), file("*"), val(sample), file(reads) from indices.combine(readPairs).take(10)
 
   output:
     set val(meta), file("*") into alignedDatasets
+    file("*.bam") into BAMs
 
   script:
     meta = idxmeta.clone() + [sample: sample]
@@ -76,6 +76,114 @@ process align {
     template "${idxmeta.tool}_align.sh"  //points to e.g. biokanga_align.sh in templates/
 }
 
+BAMs
+  .map { it.path }
+  .collectFile(newLine: true)
+  .set { BAMfofn }
+
+// BAMfofn.subscribe {println "Entries are saved to file: $it"}
+
+
+// refs4regions
+//   .splitFasta( record: [id: true], decompress: true)
+//   .subscribe { record -> println record.id }
+
+process refIds {
+
+  input:
+    file ref from refs4regions
+
+  output:
+    stdout into refIds
+
+  // exec:
+  //   println ref
+  //   println ref.name.endsWith(".gz")
+
+  script:
+  CAT = ref.name.endsWith(".gz") ? "zcat" : "cat"
+  """
+  ${CAT} ${ref} | grep '^>' | cut -d ' ' -f1 | sed 's/>//'
+  """
+}
+
+// process recompressRef {
+//   echo true
+//   module 'samtools'
+//   input:
+//     file(ref) from refs4calls
+
+//   output:
+//     file('*') into bgzRef
+
+//   script:
+//   out = ref.name.replaceAll("\\.gz\$",".bgz")
+//   """
+//   gzip -dc ${ref} | bgzip -c > ${out}
+//   """
+// }
+
+
+
+// // refIds
+// //   .splitText()
+// //   .subscribe { print it }
+process pileupAndCall {
+  label 'bcftools'
+  // module 'bcftools/1.9.0'
+  echo true
+  tag "${id}"
+
+  input:
+    set val(id), file(bamFOFN), file(ref) from refIds.splitText().map{ it.trim() }.combine(BAMfofn).combine(refs4calls)
+
+
+  // output:
+  //   stdout into refIds
+
+  // exec:
+  //   // id = comb[0].trim()
+  //   // // bamFiles = comb[(1..-2)].join("\")
+  //   // ref = comb[-1]
+  //   // print comb
+  //   println id
+  //   println bamFOFN
+  //   println ref
+  //   // println comb[(1..-2)]
+  //   // println comb[-1]
+  //   // println comb[(1..-1)]
+  //   // println id.trim()
+  //   // println meta
+  //   // println files
+  // //   println ref.name.endsWith(".gz")
+
+  script:
+  // """
+  // ls -la
+  """
+  bcftools mpileup \
+    --regions ${id}  \
+    --bam-list ${bamFOFN} \
+    --output-type z \
+    --skip-indels \
+    --annotate AD,DP \
+    --fasta-ref ${ref} \
+    --min-MQ 20 \
+    --min-BQ 20  \
+    --no-version \
+    -o mpileup_${id}.vcf.gz;\
+  """
+  // #bcftools call --multiallelic-caller --variants-only --no-version Intermediate_files/3.mpileup/mpileup_{}.vcf.gz | sed -e 's|$(pwd)\/||g' -e 's/Intermediate_files\/2\.bam_alignments\///g' -e  's/\.R.\.fastq.sorted_bam//g'  > Intermediate_files/4.Raw_SNPs/raw_SNPs_{}.vcf;\
+
+  // """
+}
+// parallel  --gnu --max-procs $NUM_CORES --keep-order "\
+
+// bcftools mpileup --regions {} --output-type z --skip-indels --annotate AD,DP --fasta-ref $REF_GENOME --min-MQ 20 --min-BQ 20  --no-version -b Intermediate_files/2.bam_alignments/samples_list.txt -o Intermediate_files/3.mpileup/mpileup_{}.vcf.gz;\
+
+// bcftools call --multiallelic-caller --variants-only --no-version Intermediate_files/3.mpileup/mpileup_{}.vcf.gz | sed -e 's|$(pwd)\/||g' -e 's/Intermediate_files\/2\.bam_alignments\///g' -e  's/\.R.\.fastq.sorted_bam//g'  > Intermediate_files/4.Raw_SNPs/raw_SNPs_{}.vcf;\
+
+// " ::: `grep ">" $REF_GENOME | cut -d ' ' -f1 | sed 's/>//g'`
 // process callVariants {
 
 //   script:
