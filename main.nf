@@ -10,8 +10,11 @@ readPairs = Channel
   .fromFilePairs('split/*_R{1,2}.fastq.gz')
   // .println()
 
+//INPUT PARAMS
+trialLines = params.trialLines
 
 url = 'ftp://ftp.ensemblgenomes.org/pub/plants/release-41/fasta/hordeum_vulgare/dna/Hordeum_vulgare.IBSC_v2.dna.toplevel.fa.gz'
+
 
 process fetchRemoteReference {
   storeDir {executor == 'awsbatch' ? "${params.outdir}/downloaded" : "downloaded"} // storeDir "${workflow.workDir}/downloaded" put the datasets there and prevent generating cost to dataset creators through repeated downloads on re-runs
@@ -23,29 +26,34 @@ process fetchRemoteReference {
     url
 
   output:
-    file "${outname}" into references, refs4regions, refs4calls
+    file ref // into references
 
   script:
-    outname = url.replaceAll(".*/","").replaceAll("\\.gz\$","")
-    if(url.endsWith(".gz")) {
-      """
-      curl $url | gunzip --stdout  > ${outname}
-      """
-    } else {
-      """
-      curl $url > ${outname}
-      """
-    }
+    outname = (trialLines == null ? "" : trialLines+"_trialLines_")+url.replaceAll(".*/","").replaceAll("\\.gz\$","")
+    ref = "${outname}"
+    TLINES = params.trialLines == null ? "" : "| head -n ${trialLines}"
+    GUNZIP = url.endsWith(".gz") ? "| gunzip --stdout" : ""
+    """
+    curl $url ${GUNZIP} ${TLINES}  > ${outname}
+    """
 }
+
+//Duplicate refs channel for 4 different downstream processes
+// refChannelsQueue = references.into(4) as Queue
 
 
 process index {
+  //Only use store dir with explicit fileNames otherwise exec skipped incorrectly
+  //storeDir {executor == 'awsbatch' ? "${workDir}/indices/${tool}" : "${workDir}/indices/${tool}"}  //hmm... could go via params to allow user-defined location?
   label 'index'
+  module { this.config.process.get("withLabel:${tool}" as String).get("module") }
   container { this.config.process.get("withLabel:${tool}" as String).get("container") }
   tag("${tool} << ${ref}")
 
   input:
-    set val (tool), file(ref) from aligners.combine(references)
+    // set val (tool), file(ref) from aligners.combine(refChannelsQueue.poll())
+    val tool from aligners
+    file ref
 
   output:
     set val(meta), file("*") into indices
@@ -57,29 +65,33 @@ process index {
 
 process align {
   label 'align'
-  label 'out'
+  // label 'out'
 
+  module { this.config.process.get("withLabel:${idxmeta.tool}" as String).get("module") }
   container { this.config.process.get("withLabel:${idxmeta.tool}" as String).get("container") }
   tag("${meta}")
 
   input:
-    set val(idxmeta), file("*"), val(sample), file(reads) from indices.combine(readPairs).take(10)
+    set val(idxmeta), file("*"), val(sample), file(reads) from indices.combine(readPairs).take(4)
 
   output:
-    set val(meta), file("*") into alignedDatasets
-    file("*.bam") into BAMs
+    //set val(meta), file("*") into alignedDatasets //don't use '*' with scratch true
+    set val(meta), file("*.?am") into BAMs //don't use '*' with scratch true
+    // file("*.bam") into BAMs
 
   script:
-    meta = idxmeta.clone() + [sample: sample]
+    meta = idxmeta.clone() + [sample: sample, sorted: idxmeta.tool=='biokanga' ? true : false]
     r1 = reads[0]
     r2 = reads[1]
     template "${idxmeta.tool}_align.sh"  //points to e.g. biokanga_align.sh in templates/
 }
 
-BAMs
-  .map { it.path }
-  .collectFile(newLine: true)
-  .set { BAMfofn }
+
+BAMfofn = BAMs.map { meta, bam -> bam.path }.collectFile(newLine: true)
+  //.toSortedList( { a,b -> a[0].sample <=> b[0].sample }) //.map { meta, bam -> bam.path }.collectFile(newLine: true)
+  // .flatMap { meta,bam -> bam.path }
+  // .subscribe { println it }
+  // .subscribe { println it[0].sample }
 
 // BAMfofn.subscribe {println "Entries are saved to file: $it"}
 
@@ -88,22 +100,38 @@ BAMs
 //   .splitFasta( record: [id: true], decompress: true)
 //   .subscribe { record -> println record.id }
 
-process refIds {
-
+process refFaidx {
+  tag("${ref}")
+  label 'samtools'
   input:
-    file ref from refs4regions
+    file ref //from refChannelsQueue.poll()
 
   output:
-    stdout into refIds
+    file fai //into faIndices
+
+  script:
+  fai = "${ref}.fai"
+  """
+  samtools faidx ${ref}
+  """
+}
+
+process refIds {
+  tag("${ref}")
+  input:
+    file ref //from refChannelsQueue.poll()
+
+  output:
+    file refIds
 
   // exec:
   //   println ref
   //   println ref.name.endsWith(".gz")
 
   script:
-  CAT = ref.name.endsWith(".gz") ? "zcat" : "cat"
+  cat = ref.name.endsWith(".gz") ? "zcat" : "cat"
   """
-  ${CAT} ${ref} | grep '^>' | cut -d ' ' -f1 | sed 's/>//'
+  ${cat} ${ref} | grep '^>' | cut -d ' ' -f1 | sed 's/>//'> refIds
   """
 }
 
@@ -125,9 +153,11 @@ process refIds {
 
 
 
-// // refIds
-// //   .splitText()
-// //   .subscribe { print it }
+
+
+// REFIDS.subscribe { println it }
+
+
 process pileupAndCall {
   label 'bcftools'
   // module 'bcftools/1.9.0'
@@ -135,20 +165,28 @@ process pileupAndCall {
   tag "${id}"
 
   input:
-    set val(id), file(bamFOFN), file(ref) from refIds.splitText().map{ it.trim() }.combine(BAMfofn).combine(refs4calls)
+    file BAMfofn
+    file fai
+    file ref
+    // set val(id), file(bamFOFN), file(ref), file(fai) from refIds.splitText().map{ it.trim() } \
+    each id from refIds.splitText().map{ it.trim() } //(refIds.splitText().map{ it.trim() })
+    // set val(id), file(ref), file(fai) from refIds.splitText().map{ it.trim() } \
+                                                                  // .combine(BAMfofn) \
+                                                                  // .combine(refChannelsQueue.poll()) \
+                                                                  // .combine(faIndices)
 
 
   // output:
-  //   stdout into refIds
+  //   file('*.vcf') into vcfs
 
   // exec:
   //   // id = comb[0].trim()
   //   // // bamFiles = comb[(1..-2)].join("\")
   //   // ref = comb[-1]
   //   // print comb
-  //   println id
-  //   println bamFOFN
-  //   println ref
+    // println id
+    // println bamFOFN
+    // println ref
   //   // println comb[(1..-2)]
   //   // println comb[-1]
   //   // println comb[(1..-1)]
@@ -162,28 +200,64 @@ process pileupAndCall {
   // ls -la
   """
   bcftools mpileup \
-    --regions ${id}  \
-    --bam-list ${bamFOFN} \
-    --output-type z \
+    --targets ${id}  \
+    --bam-list ${BAMfofn} \
     --skip-indels \
     --annotate AD,DP \
     --fasta-ref ${ref} \
     --min-MQ 20 \
     --min-BQ 20  \
     --no-version \
-    -o mpileup_${id}.vcf.gz;\
+  | bcftools call \
+    --multiallelic-caller \
+    --variants-only \
+    - \
+  | awk 'BEGIN{FS=OFS="\\t"};{if(\$1=="#CHROM"){for(i=10;i<=NF;i++){gsub(/.*\\//,"",\$i);gsub(/\\.bam\$/,"",\$i)}};print}' \
+    > ${id}.vcf
   """
   // #bcftools call --multiallelic-caller --variants-only --no-version Intermediate_files/3.mpileup/mpileup_{}.vcf.gz | sed -e 's|$(pwd)\/||g' -e 's/Intermediate_files\/2\.bam_alignments\///g' -e  's/\.R.\.fastq.sorted_bam//g'  > Intermediate_files/4.Raw_SNPs/raw_SNPs_{}.vcf;\
-
-  // """
 }
-// parallel  --gnu --max-procs $NUM_CORES --keep-order "\
 
-// bcftools mpileup --regions {} --output-type z --skip-indels --annotate AD,DP --fasta-ref $REF_GENOME --min-MQ 20 --min-BQ 20  --no-version -b Intermediate_files/2.bam_alignments/samples_list.txt -o Intermediate_files/3.mpileup/mpileup_{}.vcf.gz;\
+// process combineRegions {
+//   label 'bcftools'
+//   input:
+//     file('*') from vcfs.collect()
 
-// bcftools call --multiallelic-caller --variants-only --no-version Intermediate_files/3.mpileup/mpileup_{}.vcf.gz | sed -e 's|$(pwd)\/||g' -e 's/Intermediate_files\/2\.bam_alignments\///g' -e  's/\.R.\.fastq.sorted_bam//g'  > Intermediate_files/4.Raw_SNPs/raw_SNPs_{}.vcf;\
+//   output:
+//     file combined
 
-// " ::: `grep ">" $REF_GENOME | cut -d ' ' -f1 | sed 's/>//g'`
+//   script:
+//   combined = 'combined.vcf'
+//   """
+//   bcftools concat --no-version \$(ls -v *.vcf) > ${combined}
+//   """
+// }
+
+// thresholds = Channel.from((1..50).findAll {it % 5 == 0 })
+// process filterSNPs {
+//   label 'vcftools'
+//   label 'out'
+//   tag("minDepth = ${minDepth}")
+
+//   input:
+//     file combined
+//     val minDepth from thresholds
+
+//   output:
+//     file '*.vcf'
+
+//   script:
+//   """
+//   vcftools \
+//     --vcf ${combined} \
+//     --minDP ${minDepth} \
+//     --recode \
+//     --stdout \
+//     | awk '/#/ || /[0-9]\\/[0-9]/' \
+//     > combined_minDepth_${minDepth}.vcf
+//   """
+// }
+
 // process callVariants {
 
 //   script:
